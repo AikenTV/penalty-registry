@@ -802,15 +802,81 @@
     el.classList.toggle("err", !!isErr);
   }
 
+  // ---------- local fallback store (used outside the Claude artifact viewer, e.g. GitHub Pages) ----------
+  function makeLocalDb() {
+    var listeners = {};
+
+    function read(collection) {
+      try { return JSON.parse(localStorage.getItem("pr_" + collection) || "{}"); } catch (e) { return {}; }
+    }
+    function write(collection, obj) {
+      try { localStorage.setItem("pr_" + collection, JSON.stringify(obj)); } catch (e) {}
+    }
+    function notify(collection) {
+      var obj = read(collection);
+      var docs = Object.keys(obj).map(function (id) { return { id: id, data: function () { return obj[id]; } }; });
+      (listeners[collection] || []).forEach(function (cb) { cb({ docs: docs }); });
+    }
+
+    function collectionRef(path) {
+      return {
+        add: function (data) {
+          return new Promise(function (resolve) {
+            var obj = read(path);
+            var id = "local_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+            obj[id] = data;
+            write(path, obj);
+            notify(path);
+            resolve({ id: id });
+          });
+        },
+        onSnapshot: function (cb) {
+          listeners[path] = listeners[path] || [];
+          listeners[path].push(cb);
+          notify(path);
+          return function () { listeners[path] = (listeners[path] || []).filter(function (f) { return f !== cb; }); };
+        }
+      };
+    }
+    function docRef(fullPath) {
+      var parts = fullPath.split("/");
+      var id = parts.pop();
+      var collection = parts.join("/");
+      return {
+        update: function (data) {
+          return new Promise(function (resolve, reject) {
+            var obj = read(collection);
+            if (!obj[id]) { reject({ code: "invalid_argument", message: "not found" }); return; }
+            Object.assign(obj[id], data);
+            write(collection, obj);
+            notify(collection);
+            resolve();
+          });
+        },
+        delete: function () {
+          return new Promise(function (resolve) {
+            var obj = read(collection);
+            delete obj[id];
+            write(collection, obj);
+            notify(collection);
+            resolve();
+          });
+        }
+      };
+    }
+    return { collection: collectionRef, doc: docRef };
+  }
+
   // ---------- boot ----------
   async function boot() {
     var claudeDb = (window.claude && typeof window.claude.use === "function") ? await window.claude.use("db") : null;
     if (!claudeDb) {
-      setConnStatus("База данных недоступна в этом просмотре", true);
-      return;
+      db = makeLocalDb();
+      setConnStatus("Локальный режим — данные хранятся только в этом браузере, без общего доступа команды");
+    } else {
+      db = claudeDb;
+      setConnStatus("Подключено");
     }
-    db = claudeDb;
-    setConnStatus("Подключено");
 
     db.collection("rules").onSnapshot(function (snap) {
       state.rules = snap.docs.map(function (d) { return Object.assign({ id: d.id }, d.data()); });
